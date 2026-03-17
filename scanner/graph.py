@@ -537,3 +537,30 @@ def create_jira_ticket(vuln: dict, project_key: str | None = None, inspect_data:
             return {"error": f"Jira API error ({resp.status_code}): {resp.text[:300]}"}
     except Exception as e:
         return {"error": f"Failed to create Jira ticket: {e}"}
+
+
+def create_jira_tickets_bulk(vulns: list[dict], severity_filter: str = "CRITICAL") -> dict:
+    """Create Jira tickets for all vulnerabilities matching the severity filter.
+
+    Returns a summary with created tickets and any errors.
+    """
+    filtered = [v for v in vulns if v.get("severity") == severity_filter]
+    if not filtered:
+        return {"created": [], "errors": [], "total": 0, "message": f"No {severity_filter} issues found."}
+
+    created = []
+    errors = []
+    for vuln in filtered:
+        result = create_jira_ticket(vuln)
+        if result.get("error"):
+            errors.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", "?"), "error": result["error"]})
+        else:
+            created.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", "?"), "key": result["key"], "url": result["url"]})
+
+    return {
+        "created": created,
+        "errors": errors,
+        "total": len(filtered),
+        "success_count": len(created),
+        "error_count": len(errors),
+    }
