@@ -465,15 +465,60 @@ JIRA_SEVERITY_TO_PRIORITY = {
 }
 
 
+def _get_jira_auth() -> tuple[str, str, str, str]:
+    """Return (base_url, email, token, project) from env vars."""
+    return (
+        os.environ.get("JIRA_BASE_URL", "").rstrip("/"),
+        os.environ.get("JIRA_EMAIL", ""),
+        os.environ.get("JIRA_API_TOKEN", ""),
+        os.environ.get("JIRA_PROJECT_KEY", ""),
+    )
+
+
+def _get_active_sprint_id() -> int | None:
+    """Find the active sprint ID for the project's board."""
+    base_url, email, token, project = _get_jira_auth()
+    if not all([base_url, email, token, project]):
+        return None
+    try:
+        # Get boards for the project
+        resp = http_requests.get(
+            f"{base_url}/rest/agile/1.0/board",
+            params={"projectKeyOrId": project},
+            auth=(email, token),
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return None
+        boards = resp.json().get("values", [])
+        if not boards:
+            return None
+        board_id = boards[0]["id"]
+
+        # Get active sprint
+        resp2 = http_requests.get(
+            f"{base_url}/rest/agile/1.0/board/{board_id}/sprint",
+            params={"state": "active"},
+            auth=(email, token),
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        if resp2.status_code != 200:
+            return None
+        sprints = resp2.json().get("values", [])
+        return sprints[0]["id"] if sprints else None
+    except Exception:
+        return None
+
+
 def create_jira_ticket(vuln: dict, project_key: str | None = None, inspect_data: dict | None = None) -> dict:
     """Create a Jira ticket for a vulnerability.
 
     Requires env vars: JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY (fallback).
     """
-    base_url = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
-    email = os.environ.get("JIRA_EMAIL", "")
-    token = os.environ.get("JIRA_API_TOKEN", "")
-    project = project_key or os.environ.get("JIRA_PROJECT_KEY", "")
+    base_url, email, token, default_project = _get_jira_auth()
+    project = project_key or default_project
 
     if not all([base_url, email, token, project]):
         return {"error": "Jira not configured. Set JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY."}
@@ -506,16 +551,21 @@ def create_jira_ticket(vuln: dict, project_key: str | None = None, inspect_data:
         if inspect_data.get("prevention"):
             desc_parts.append(f"\n*Prevention:*\n{inspect_data['prevention']}")
 
-    payload = {
-        "fields": {
-            "project": {"key": project},
-            "summary": title[:255],
-            "description": "\n".join(desc_parts),
-            "issuetype": {"name": "Bug"},
-            "priority": {"name": JIRA_SEVERITY_TO_PRIORITY.get(severity, "Medium")},
-            "labels": ["security", "secscan", severity.lower()],
-        }
+    fields = {
+        "project": {"key": project},
+        "summary": title[:255],
+        "description": "\n".join(desc_parts),
+        "issuetype": {"name": "Bug"},
+        "priority": {"name": JIRA_SEVERITY_TO_PRIORITY.get(severity, "Medium")},
+        "labels": ["security", "secscan", severity.lower()],
     }
+
+    # Try to assign to active sprint so ticket lands in To Do, not Backlog
+    sprint_id = _get_active_sprint_id()
+    if sprint_id:
+        fields["customfield_10020"] = sprint_id  # Sprint field
+
+    payload = {"fields": fields}
 
     try:
         resp = http_requests.post(
@@ -537,3 +587,250 @@ def create_jira_ticket(vuln: dict, project_key: str | None = None, inspect_data:
             return {"error": f"Jira API error ({resp.status_code}): {resp.text[:300]}"}
     except Exception as e:
         return {"error": f"Failed to create Jira ticket: {e}"}
+
+
+def create_jira_tickets_bulk(vulns: list[dict], severity_filter: str = "CRITICAL") -> dict:
+    """Create Jira tickets for all vulnerabilities matching the severity filter.
+
+    Returns a summary with created tickets and any errors.
+    """
+    filtered = [v for v in vulns if v.get("severity") == severity_filter]
+    if not filtered:
+        return {"created": [], "errors": [], "total": 0, "message": f"No {severity_filter} issues found."}
+
+    created = []
+    errors = []
+    for vuln in filtered:
+        result = create_jira_ticket(vuln)
+        if result.get("error"):
+            errors.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", "?"), "error": result["error"]})
+        else:
+            created.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", "?"), "key": result["key"], "url": result["url"]})
+
+    return {
+        "created": created,
+        "errors": errors,
+        "total": len(filtered),
+        "success_count": len(created),
+        "error_count": len(errors),
+    }
+
+
+# ── Fetch Jira security tickets ───────────────────────────────────────────
+
+def fetch_jira_security_tickets() -> list[dict]:
+    """Fetch open security-labelled tickets from Jira."""
+    base_url, email, token, project = _get_jira_auth()
+    if not all([base_url, email, token, project]):
+        return []
+
+    jql = f"project={project} AND labels=security AND status != Done ORDER BY priority DESC"
+
+    # Try v3 search first (new Jira Cloud), fall back to v2
+    for api_path in ["/rest/api/3/search/jql", "/rest/api/2/search"]:
+        try:
+            if "jql" in api_path:
+                # v3 uses POST with JSON body
+                resp = http_requests.post(
+                    f"{base_url}{api_path}",
+                    json={"jql": jql, "maxResults": 50, "fields": ["summary", "description", "status", "priority", "labels"]},
+                    auth=(email, token),
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    timeout=15,
+                )
+            else:
+                resp = http_requests.get(
+                    f"{base_url}{api_path}",
+                    params={"jql": jql, "maxResults": 50, "fields": "summary,description,status,priority,labels"},
+                    auth=(email, token),
+                    headers={"Accept": "application/json"},
+                    timeout=15,
+                )
+            if resp.status_code == 200:
+                issues = resp.json().get("issues", [])
+                return [
+                    {
+                        "key": iss["key"],
+                        "summary": iss["fields"].get("summary", ""),
+                        "description": iss["fields"].get("description", ""),
+                        "status": iss["fields"].get("status", {}).get("name", ""),
+                        "priority": iss["fields"].get("priority", {}).get("name", ""),
+                        "labels": iss["fields"].get("labels", []),
+                    }
+                    for iss in issues
+                ]
+        except Exception:
+            continue
+    return []
+
+
+# ── Auto-fix agent ────────────────────────────────────────────────────────
+
+def _generate_fix_for_vuln(vuln_title: str, vuln_description: str, file_path: str, file_content: str) -> dict | None:
+    """Use AI to generate a code fix for a vulnerability."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return None
+
+    llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0, max_tokens=4096)
+
+    prompt = f"""You are a senior security engineer. Fix the security vulnerability described below in the given file.
+
+Vulnerability: {vuln_title}
+Description: {vuln_description}
+File: {file_path}
+
+Current file content:
+```
+{file_content[:6000]}
+```
+
+Respond with a JSON object:
+{{
+  "fixed_content": "the complete fixed file content",
+  "changes_summary": "brief description of what was changed and why"
+}}
+
+Respond ONLY with the JSON object. The fixed_content must be the COMPLETE file, not a diff."""
+
+    try:
+        resp = llm.invoke([HumanMessage(content=prompt)])
+        text = resp.content.strip()
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+    except Exception:
+        pass
+    return None
+
+
+def autofix_from_scan(repo_url: str, vulnerabilities: list[dict]) -> dict:
+    """Clone repo, fix vulnerabilities, create branch, commit, push, and create PR.
+
+    Returns a summary of what was fixed and the PR URL.
+    """
+    if not vulnerabilities:
+        return {"error": "No vulnerabilities to fix.", "fixes": []}
+
+    # Only fix CRITICAL and HIGH
+    fixable = [v for v in vulnerabilities if v.get("severity") in ("CRITICAL", "HIGH")]
+    if not fixable:
+        return {"error": "No CRITICAL or HIGH vulnerabilities to auto-fix.", "fixes": []}
+
+    # Clone repo
+    tmp = tempfile.mkdtemp(prefix="autofix_")
+    try:
+        subprocess.run(
+            ["git", "clone", repo_url, tmp],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Clone failed: {e.stderr}", "fixes": []}
+
+    branch_name = "autofix/security-vulnerabilities"
+    try:
+        subprocess.run(["git", "checkout", "-b", branch_name], cwd=tmp, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        pass
+
+    fixes = []
+    for vuln in fixable:
+        file_rel = vuln.get("file", "")
+        if not file_rel:
+            continue
+        file_abs = os.path.join(tmp, file_rel)
+        if not os.path.isfile(file_abs):
+            fixes.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", ""), "status": "skipped", "reason": "file not found"})
+            continue
+
+        try:
+            with open(file_abs, "r", errors="ignore") as f:
+                original = f.read()
+        except Exception:
+            fixes.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", ""), "status": "skipped", "reason": "could not read file"})
+            continue
+
+        fix_result = _generate_fix_for_vuln(
+            vuln.get("title", ""), vuln.get("description", ""), file_rel, original
+        )
+        if not fix_result or not fix_result.get("fixed_content"):
+            fixes.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", ""), "status": "failed", "reason": "AI could not generate fix"})
+            continue
+
+        fixed_content = fix_result["fixed_content"]
+        if fixed_content.strip() == original.strip():
+            fixes.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", ""), "status": "skipped", "reason": "no changes needed"})
+            continue
+
+        # Write fix
+        with open(file_abs, "w") as f:
+            f.write(fixed_content)
+
+        fixes.append({
+            "vuln_id": vuln.get("id", "?"),
+            "title": vuln.get("title", ""),
+            "file": file_rel,
+            "status": "fixed",
+            "summary": fix_result.get("changes_summary", ""),
+        })
+
+    # Check if any fixes were applied
+    applied = [f for f in fixes if f["status"] == "fixed"]
+    if not applied:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return {"fixes": fixes, "pr_url": None, "message": "No fixes could be applied."}
+
+    # Commit and push
+    try:
+        subprocess.run(["git", "add", "-A"], cwd=tmp, check=True, capture_output=True, text=True)
+
+        commit_msg = f"fix: auto-fix {len(applied)} security vulnerabilities\n\n"
+        for f in applied:
+            commit_msg += f"- [{f['vuln_id']}] {f['title']} in {f.get('file', '?')}\n"
+        commit_msg += "\nGenerated by SecScan Agent"
+
+        subprocess.run(
+            ["git", "commit", "-m", commit_msg],
+            cwd=tmp, check=True, capture_output=True, text=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "SecScan Agent", "GIT_AUTHOR_EMAIL": "secscan@agent.local",
+                 "GIT_COMMITTER_NAME": "SecScan Agent", "GIT_COMMITTER_EMAIL": "secscan@agent.local"},
+        )
+
+        subprocess.run(
+            ["git", "push", "-u", "origin", branch_name],
+            cwd=tmp, check=True, capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.CalledProcessError as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        return {"fixes": fixes, "pr_url": None, "error": f"Git push failed: {e.stderr[:300]}"}
+
+    # Create PR via gh CLI
+    pr_url = None
+    pr_body = "## Security Fixes\n\n"
+    pr_body += f"Auto-fixed **{len(applied)}** security vulnerabilities found by SecScan Agent.\n\n"
+    for f in applied:
+        pr_body += f"- **[{f['vuln_id']}]** {f['title']} in `{f.get('file', '?')}`\n"
+        if f.get("summary"):
+            pr_body += f"  - {f['summary']}\n"
+    pr_body += "\n---\n*Generated by SecScan Agent*"
+
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "create", "--title", f"fix: auto-fix {len(applied)} security vulnerabilities",
+             "--body", pr_body, "--head", branch_name],
+            cwd=tmp, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            pr_url = result.stdout.strip()
+    except Exception:
+        pass
+
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    return {
+        "fixes": fixes,
+        "pr_url": pr_url,
+        "fixed_count": len(applied),
+        "total_attempted": len(fixable),
+        "message": f"Fixed {len(applied)}/{len(fixable)} vulnerabilities." + (f" PR: {pr_url}" if pr_url else " Push succeeded but PR creation failed (gh CLI may not be configured)."),
+    }
