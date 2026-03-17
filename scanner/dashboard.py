@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string, request
 
-from .graph import chat_with_agent, create_jira_ticket, create_jira_tickets_bulk, inspect_vulnerability, run_scan
+from .graph import autofix_from_scan, chat_with_agent, create_jira_ticket, create_jira_tickets_bulk, fetch_jira_security_tickets, inspect_vulnerability, run_scan
 
 app = Flask(__name__)
 
@@ -321,6 +321,42 @@ body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); c
 .bulk-jira-progress.active { display: block; }
 .bulk-jira-progress .bar { height: 100%; background: linear-gradient(90deg, #0052cc, var(--accent)); border-radius: 2px; transition: width 0.3s; }
 
+/* ── Auto-fix section ── */
+.autofix-section {
+  display: none; margin-top: 2rem; padding: 1.5rem; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 16px;
+}
+.autofix-section.visible { display: block; animation: slideDown 0.3s ease; }
+.autofix-header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.autofix-header h3 { font-size: 1rem; font-weight: 700; flex: 1; }
+.autofix-btn {
+  padding: 0.7rem 1.6rem; background: linear-gradient(135deg, var(--green), #00a854); border: none; border-radius: 10px;
+  color: #fff; font-family: 'Inter', sans-serif; font-size: 0.82rem; font-weight: 700; cursor: pointer;
+  transition: all 0.3s; display: inline-flex; align-items: center; gap: 0.5rem;
+}
+.autofix-btn:hover { transform: translateY(-2px); box-shadow: 0 4px 20px rgba(0,230,118,0.2); }
+.autofix-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+.autofix-desc { font-size: 0.78rem; color: var(--muted); margin-bottom: 1rem; }
+.autofix-jira-list { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 1rem; max-height: 300px; overflow-y: auto; }
+.autofix-jira-item {
+  display: flex; align-items: center; gap: 0.75rem; padding: 0.7rem 1rem; background: var(--surface2);
+  border: 1px solid var(--border); border-radius: 10px; font-size: 0.78rem;
+}
+.autofix-jira-item .jira-key { font-family: 'JetBrains Mono', monospace; color: var(--accent); font-weight: 600; min-width: 80px; }
+.autofix-jira-item .jira-summary { flex: 1; }
+.autofix-jira-item .jira-status { font-size: 0.65rem; padding: 0.15rem 0.5rem; background: var(--surface3); border-radius: 4px; color: var(--muted); font-weight: 600; text-transform: uppercase; }
+.autofix-results { margin-top: 1rem; }
+.autofix-results .fix-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.5rem 0; border-bottom: 1px solid var(--border); font-size: 0.78rem; }
+.autofix-results .fix-row:last-child { border-bottom: none; }
+.autofix-results .fix-ok { color: var(--green); }
+.autofix-results .fix-skip { color: var(--muted); }
+.autofix-results .fix-fail { color: var(--critical); }
+.autofix-pr { margin-top: 1rem; padding: 0.8rem 1rem; background: var(--green-bg); border: 1px solid rgba(0,230,118,0.2); border-radius: 10px; font-size: 0.82rem; }
+.autofix-pr a { color: var(--green); font-weight: 600; text-decoration: underline; }
+.autofix-progress { width: 100%; height: 3px; background: var(--surface3); border-radius: 2px; margin-top: 0.5rem; overflow: hidden; display: none; }
+.autofix-progress.active { display: block; }
+.autofix-progress .bar { height: 100%; background: linear-gradient(90deg, var(--green), var(--accent)); border-radius: 2px; transition: width 0.5s; }
+
 /* ── Responsive ── */
 @media (max-width: 900px) {
   .severity-grid { grid-template-columns: repeat(3, 1fr); }
@@ -392,6 +428,18 @@ body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); c
         </div>
         <div class="vuln-list" id="vulnList"></div>
       </div>
+    </div>
+
+    <!-- Auto-fix section -->
+    <div class="autofix-section" id="autofixSection">
+      <div class="autofix-header">
+        <h3>Auto-Fix Agent</h3>
+        <button class="autofix-btn" id="autofixBtn" onclick="runAutofix()">Fix All Issues &amp; Raise PR</button>
+      </div>
+      <p class="autofix-desc">The agent will fetch open security tickets from Jira, generate fixes for CRITICAL and HIGH vulnerabilities, commit the changes, and raise a Pull Request.</p>
+      <div id="autofixJiraList" class="autofix-jira-list"></div>
+      <div class="autofix-progress" id="autofixProgress"><div class="bar" id="autofixProgressBar" style="width:0%"></div></div>
+      <div class="autofix-results" id="autofixResults"></div>
     </div>
 
     <!-- Empty -->
@@ -532,6 +580,20 @@ function renderResults(data) {
     bulkBar.classList.add('visible');
   } else {
     bulkBar.classList.remove('visible');
+  }
+
+  // Show auto-fix section if there are CRITICAL or HIGH issues
+  const critHigh = s.critical + s.high;
+  const autofixSec = document.getElementById('autofixSection');
+  if (critHigh > 0) {
+    autofixSec.classList.add('visible');
+    document.getElementById('autofixBtn').disabled = false;
+    document.getElementById('autofixBtn').textContent = 'Fix All Issues & Raise PR';
+    document.getElementById('autofixBtn').style.background = 'linear-gradient(135deg, var(--green), #00a854)';
+    document.getElementById('autofixResults').innerHTML = '';
+    loadJiraTickets();
+  } else {
+    autofixSec.classList.remove('visible');
   }
 }
 
@@ -772,6 +834,84 @@ async function bulkJiraCreate() {
   btn.dataset.state = 'done';
 }
 
+/* ── Auto-fix agent ── */
+async function loadJiraTickets() {
+  const list = document.getElementById('autofixJiraList');
+  list.innerHTML = '<div style="color:var(--muted);font-size:0.78rem;padding:0.5rem;">Loading Jira tickets...</div>';
+  try {
+    const resp = await fetch('/api/jira/tickets');
+    const data = await resp.json();
+    if (data.tickets && data.tickets.length) {
+      list.innerHTML = data.tickets.map(t =>
+        `<div class="autofix-jira-item">
+          <span class="jira-key">${esc(t.key)}</span>
+          <span class="jira-summary">${esc(t.summary)}</span>
+          <span class="jira-status">${esc(t.status)}</span>
+        </div>`
+      ).join('');
+    } else {
+      list.innerHTML = '<div style="color:var(--muted);font-size:0.78rem;padding:0.5rem;">No open security tickets found in Jira.</div>';
+    }
+  } catch(e) {
+    list.innerHTML = '<div style="color:var(--critical);font-size:0.78rem;padding:0.5rem;">Failed to load Jira tickets.</div>';
+  }
+}
+
+async function runAutofix() {
+  if (!scanData || !scanData.vulnerabilities || !scanData.vulnerabilities.length) return;
+  const btn = document.getElementById('autofixBtn');
+  const results = document.getElementById('autofixResults');
+  const progress = document.getElementById('autofixProgress');
+  const bar = document.getElementById('autofixProgressBar');
+
+  btn.disabled = true;
+  btn.textContent = 'Fixing issues...';
+  results.innerHTML = '';
+  progress.classList.add('active');
+  bar.style.width = '10%';
+
+  try {
+    bar.style.width = '30%';
+    const resp = await fetch('/api/autofix', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ repo_url: scanData.repo_url, vulnerabilities: scanData.vulnerabilities }),
+    });
+    bar.style.width = '80%';
+    const data = await resp.json();
+    bar.style.width = '100%';
+
+    if (data.error && !data.fixes) {
+      results.innerHTML = '<div class="fix-fail">' + esc(data.error) + '</div>';
+    } else {
+      let html = '';
+      if (data.fixes && data.fixes.length) {
+        html += data.fixes.map(f => {
+          const icon = f.status === 'fixed' ? '<span class="fix-ok">&#10003;</span>' :
+                       f.status === 'failed' ? '<span class="fix-fail">&#10007;</span>' :
+                       '<span class="fix-skip">&#8212;</span>';
+          const detail = f.status === 'fixed' ? esc(f.summary || '') : esc(f.reason || '');
+          return `<div class="fix-row">${icon} <b>${esc(f.vuln_id || '')}</b> ${esc(f.title || '')} ${f.file ? 'in <code>'+esc(f.file)+'</code>' : ''} <span style="color:var(--muted);margin-left:auto;">${detail}</span></div>`;
+        }).join('');
+      }
+      if (data.pr_url) {
+        html += `<div class="autofix-pr">Pull Request created: <a href="${esc(data.pr_url)}" target="_blank" rel="noopener">${esc(data.pr_url)}</a></div>`;
+      }
+      if (data.message) {
+        html += `<div style="margin-top:0.5rem;font-size:0.78rem;color:var(--text2);">${esc(data.message)}</div>`;
+      }
+      results.innerHTML = html;
+      btn.textContent = (data.fixed_count || 0) + ' issues fixed';
+      btn.style.background = 'linear-gradient(135deg, #00a854, #007a3d)';
+    }
+  } catch(e) {
+    results.innerHTML = '<div class="fix-fail">Network error: ' + esc(e.message) + '</div>';
+  }
+
+  setTimeout(() => progress.classList.remove('active'), 1000);
+  btn.disabled = false;
+}
+
 function esc(s) { const d = document.createElement('div'); d.textContent = s||''; return d.innerHTML; }
 </script>
 </body>
@@ -856,6 +996,26 @@ def api_jira_bulk():
         return jsonify({"error": "No scan data available. Run a scan first."}), 400
 
     result = create_jira_tickets_bulk(vulns, severity_filter=severity)
+    return jsonify(result)
+
+
+@app.route("/api/jira/tickets")
+def api_jira_tickets():
+    tickets = fetch_jira_security_tickets()
+    return jsonify({"tickets": tickets})
+
+
+@app.route("/api/autofix", methods=["POST"])
+def api_autofix():
+    data = request.get_json(force=True)
+    repo_url = data.get("repo_url", "")
+    vulns = data.get("vulnerabilities", [])
+    if not repo_url:
+        return jsonify({"error": "repo_url is required"}), 400
+    if not vulns:
+        return jsonify({"error": "No vulnerabilities provided"}), 400
+
+    result = autofix_from_scan(repo_url, vulns)
     return jsonify(result)
 
 
