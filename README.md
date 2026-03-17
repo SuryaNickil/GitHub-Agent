@@ -76,15 +76,20 @@ Seamless issue tracking integration:
 - **Auto-populated fields**: severity-mapped priority, security labels, detailed descriptions with fix guidance
 - **Sprint assignment**: Tickets land in the active sprint (To Do), not the backlog
 
-### AI Auto-Fix Agent
-The most powerful feature — an autonomous remediation pipeline:
-1. Fetches open security tickets from Jira
-2. Clones the target repository
-3. Uses AI to generate fixes for each CRITICAL and HIGH vulnerability
-4. Commits all fixes to a new branch
-5. Pushes and opens a Pull Request automatically
+### AI Auto-Fix Agent (Two Modes)
 
-**Zero manual intervention from detection to PR.**
+**Mode 1 — Fix from Scan Results:** Fixes CRITICAL and HIGH vulnerabilities found in the current scan.
+
+**Mode 2 — Fix from Jira Tickets:** The most powerful feature — a fully autonomous remediation pipeline:
+1. Fetches all open security tickets from Jira
+2. Parses vulnerability details (file, line, severity) from each ticket
+3. Clones the target repository
+4. Uses AI to generate fixes for every vulnerability
+5. Commits all fixes to a `security-fixes` branch
+6. Pushes and opens a Pull Request automatically
+7. Transitions fixed Jira tickets to "Done"
+
+**Zero manual intervention from Jira ticket to merged PR.**
 
 ---
 
@@ -106,7 +111,7 @@ repo-security-scanner/
 |-------|-----------|---------|
 | **Agent Framework** | LangGraph (StateGraph) | Orchestrates parallel scanner agents with fan-out/fan-in |
 | **AI Models** | Claude Sonnet 4.6 | Deep code review during scan |
-| | Claude Haiku 4.5 | Chat assistant, vulnerability inspection, auto-fix generation |
+| | Claude Haiku 4.5 | Chat assistant, vulnerability inspection, auto-fix generation, Jira ticket analysis |
 | **Static Analysis** | Bandit | Python SAST with CWE mapping |
 | **Web Framework** | Flask | Dashboard API and SPA serving |
 | **Issue Tracking** | Jira REST API v2/v3 | Ticket creation, sprint assignment, bulk operations |
@@ -214,27 +219,48 @@ Click any vulnerability to get an AI-generated deep-dive:
 
 ### 3. Jira Ticket Creation
 
-One click creates tickets for all critical vulnerabilities:
+One click creates tickets for all critical vulnerabilities with **AI-enriched descriptions**:
 - Summary: `[CRITICAL] Hardcoded Secret/Password`
 - Priority: Mapped from severity (Critical -> Highest, High -> High, etc.)
 - Labels: `security`, `secscan`, `critical`
-- Description: Full vulnerability details + AI-generated fix guidance
+- Description includes:
+  - What was found and why it's dangerous
+  - Potential attack impact scenarios
+  - Step-by-step fix instructions
+  - Vulnerable code (before) and fixed code (after)
+  - Prevention guidance and OWASP/CWE references
 - Sprint: Automatically assigned to the active sprint
 
-### 4. Auto-Fix Agent
+### 4. Auto-Fix Agent (Scan-Based)
 
-The auto-fix pipeline runs autonomously:
+Fix vulnerabilities directly from scan results:
 ```
-Fetch Jira security tickets
-    --> Filter CRITICAL + HIGH
+Filter CRITICAL + HIGH from scan
     --> Clone target repo
-    --> For each vulnerability:
-        AI generates complete fixed file
-        Write fix to disk
+    --> AI generates fix for each vulnerability
     --> git checkout -b autofix/security-vulnerabilities
     --> git commit + push
     --> gh pr create with detailed changelist
 ```
+
+### 5. Jira Auto-Fix Agent (Ticket-Based)
+
+The most powerful feature — a fully autonomous remediation pipeline driven by Jira:
+```
+Fetch all open security tickets from Jira
+    --> Parse vulnerability details (file, line, severity) from each ticket
+    --> Clone target repo
+    --> git checkout -b security-fixes
+    --> For each ticket:
+        AI reads the vulnerable file
+        AI generates complete fixed file content
+        Write fix to disk
+    --> git commit + push (with Jira ticket refs in commit message)
+    --> gh pr create with full changelist
+    --> Transition fixed Jira tickets to "Done"
+```
+
+**End-to-end automation: from Jira ticket to merged PR, zero manual intervention.**
 
 ---
 

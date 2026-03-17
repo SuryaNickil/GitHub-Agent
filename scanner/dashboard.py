@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, render_template_string, request
 
-from .graph import autofix_from_scan, chat_with_agent, create_jira_ticket, create_jira_tickets_bulk, fetch_jira_security_tickets, inspect_vulnerability, run_scan
+from .graph import autofix_from_jira, autofix_from_scan, chat_with_agent, create_jira_ticket, create_jira_tickets_bulk, fetch_jira_security_tickets, inspect_vulnerability, run_scan
 
 app = Flask(__name__)
 
@@ -434,9 +434,13 @@ body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); c
     <div class="autofix-section" id="autofixSection">
       <div class="autofix-header">
         <h3>Auto-Fix Agent</h3>
-        <button class="autofix-btn" id="autofixBtn" onclick="runAutofix()">Fix All Issues &amp; Raise PR</button>
+        <div style="display:flex;gap:0.5rem;">
+          <button class="autofix-btn" id="autofixBtn" onclick="runAutofix()">Fix from Scan Results</button>
+          <button class="autofix-btn" id="jiraAutofixBtn" onclick="runJiraAutofix()" style="background:linear-gradient(135deg, var(--accent), var(--accent2));">Fix from Jira Tickets</button>
+        </div>
       </div>
-      <p class="autofix-desc">The agent will fetch open security tickets from Jira, generate fixes for CRITICAL and HIGH vulnerabilities, commit the changes, and raise a Pull Request.</p>
+      <p class="autofix-desc"><b>Fix from Scan Results:</b> Uses current scan findings to fix CRITICAL &amp; HIGH vulnerabilities.<br/>
+      <b>Fix from Jira Tickets:</b> Fetches all open security tickets from Jira, clones the repo, generates AI fixes for each ticket, commits to a <code>security-fixes</code> branch, raises a PR, and marks tickets as Done.</p>
       <div id="autofixJiraList" class="autofix-jira-list"></div>
       <div class="autofix-progress" id="autofixProgress"><div class="bar" id="autofixProgressBar" style="width:0%"></div></div>
       <div class="autofix-results" id="autofixResults"></div>
@@ -588,8 +592,11 @@ function renderResults(data) {
   if (critHigh > 0) {
     autofixSec.classList.add('visible');
     document.getElementById('autofixBtn').disabled = false;
-    document.getElementById('autofixBtn').textContent = 'Fix All Issues & Raise PR';
+    document.getElementById('autofixBtn').textContent = 'Fix from Scan Results';
     document.getElementById('autofixBtn').style.background = 'linear-gradient(135deg, var(--green), #00a854)';
+    document.getElementById('jiraAutofixBtn').disabled = false;
+    document.getElementById('jiraAutofixBtn').textContent = 'Fix from Jira Tickets';
+    document.getElementById('jiraAutofixBtn').style.background = 'linear-gradient(135deg, var(--accent), var(--accent2))';
     document.getElementById('autofixResults').innerHTML = '';
     loadJiraTickets();
   } else {
@@ -880,29 +887,55 @@ async function runAutofix() {
     bar.style.width = '80%';
     const data = await resp.json();
     bar.style.width = '100%';
+    renderAutofixResults(data, btn);
+  } catch(e) {
+    results.innerHTML = '<div class="fix-fail">Network error: ' + esc(e.message) + '</div>';
+  }
 
+  setTimeout(() => progress.classList.remove('active'), 1000);
+  btn.disabled = false;
+}
+
+async function runJiraAutofix() {
+  if (!scanData || !scanData.repo_url) return;
+  const btn = document.getElementById('jiraAutofixBtn');
+  const results = document.getElementById('autofixResults');
+  const progress = document.getElementById('autofixProgress');
+  const bar = document.getElementById('autofixProgressBar');
+
+  btn.disabled = true;
+  btn.textContent = 'Scanning Jira & fixing...';
+  results.innerHTML = '';
+  progress.classList.add('active');
+  bar.style.width = '5%';
+
+  try {
+    bar.style.width = '15%';
+    const resp = await fetch('/api/autofix/jira', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ repo_url: scanData.repo_url }),
+    });
+    bar.style.width = '85%';
+    const data = await resp.json();
+    bar.style.width = '100%';
+
+    let html = '';
+    if (data.tickets_found !== undefined) {
+      html += `<div style="font-size:0.78rem;color:var(--text2);margin-bottom:0.5rem;">Found <b>${data.tickets_found}</b> Jira tickets, parsed <b>${data.tickets_parsed || 0}</b> vulnerabilities</div>`;
+    }
     if (data.error && !data.fixes) {
-      results.innerHTML = '<div class="fix-fail">' + esc(data.error) + '</div>';
-    } else {
-      let html = '';
-      if (data.fixes && data.fixes.length) {
-        html += data.fixes.map(f => {
-          const icon = f.status === 'fixed' ? '<span class="fix-ok">&#10003;</span>' :
-                       f.status === 'failed' ? '<span class="fix-fail">&#10007;</span>' :
-                       '<span class="fix-skip">&#8212;</span>';
-          const detail = f.status === 'fixed' ? esc(f.summary || '') : esc(f.reason || '');
-          return `<div class="fix-row">${icon} <b>${esc(f.vuln_id || '')}</b> ${esc(f.title || '')} ${f.file ? 'in <code>'+esc(f.file)+'</code>' : ''} <span style="color:var(--muted);margin-left:auto;">${detail}</span></div>`;
-        }).join('');
-      }
-      if (data.pr_url) {
-        html += `<div class="autofix-pr">Pull Request created: <a href="${esc(data.pr_url)}" target="_blank" rel="noopener">${esc(data.pr_url)}</a></div>`;
-      }
-      if (data.message) {
-        html += `<div style="margin-top:0.5rem;font-size:0.78rem;color:var(--text2);">${esc(data.message)}</div>`;
-      }
+      html += '<div class="fix-fail">' + esc(data.error) + '</div>';
       results.innerHTML = html;
-      btn.textContent = (data.fixed_count || 0) + ' issues fixed';
-      btn.style.background = 'linear-gradient(135deg, #00a854, #007a3d)';
+    } else {
+      renderAutofixResults(data, btn, html);
+    }
+
+    if (data.tickets_transitioned && data.tickets_transitioned.length) {
+      let tHtml = '<div style="margin-top:0.5rem;font-size:0.78rem;color:var(--green);"><b>Jira tickets transitioned to Done:</b> ';
+      tHtml += data.tickets_transitioned.filter(t => t.transitioned).map(t => t.key).join(', ');
+      tHtml += '</div>';
+      results.innerHTML += tHtml;
     }
   } catch(e) {
     results.innerHTML = '<div class="fix-fail">Network error: ' + esc(e.message) + '</div>';
@@ -910,6 +943,34 @@ async function runAutofix() {
 
   setTimeout(() => progress.classList.remove('active'), 1000);
   btn.disabled = false;
+}
+
+function renderAutofixResults(data, btn, prefix) {
+  const results = document.getElementById('autofixResults');
+  let html = prefix || '';
+  if (data.error && !data.fixes) {
+    results.innerHTML = html + '<div class="fix-fail">' + esc(data.error) + '</div>';
+    return;
+  }
+  if (data.fixes && data.fixes.length) {
+    html += data.fixes.map(f => {
+      const icon = f.status === 'fixed' ? '<span class="fix-ok">&#10003;</span>' :
+                   f.status === 'failed' ? '<span class="fix-fail">&#10007;</span>' :
+                   '<span class="fix-skip">&#8212;</span>';
+      const detail = f.status === 'fixed' ? esc(f.summary || '') : esc(f.reason || '');
+      const jiraRef = f.jira_key ? ' <span style="color:var(--accent);font-size:0.72rem;">' + esc(f.jira_key) + '</span>' : '';
+      return `<div class="fix-row">${icon} <b>${esc(f.vuln_id || '')}</b>${jiraRef} ${esc(f.title || '')} ${f.file ? 'in <code>'+esc(f.file)+'</code>' : ''} <span style="color:var(--muted);margin-left:auto;">${detail}</span></div>`;
+    }).join('');
+  }
+  if (data.pr_url) {
+    html += `<div class="autofix-pr">Pull Request created: <a href="${esc(data.pr_url)}" target="_blank" rel="noopener">${esc(data.pr_url)}</a></div>`;
+  }
+  if (data.message) {
+    html += `<div style="margin-top:0.5rem;font-size:0.78rem;color:var(--text2);">${esc(data.message)}</div>`;
+  }
+  results.innerHTML = html;
+  btn.textContent = (data.fixed_count || 0) + ' issues fixed';
+  btn.style.background = 'linear-gradient(135deg, #00a854, #007a3d)';
 }
 
 function esc(s) { const d = document.createElement('div'); d.textContent = s||''; return d.innerHTML; }
@@ -1016,6 +1077,17 @@ def api_autofix():
         return jsonify({"error": "No vulnerabilities provided"}), 400
 
     result = autofix_from_scan(repo_url, vulns)
+    return jsonify(result)
+
+
+@app.route("/api/autofix/jira", methods=["POST"])
+def api_autofix_jira():
+    data = request.get_json(force=True)
+    repo_url = data.get("repo_url", "")
+    if not repo_url:
+        return jsonify({"error": "repo_url is required"}), 400
+
+    result = autofix_from_jira(repo_url)
     return jsonify(result)
 
 

@@ -512,6 +512,49 @@ def _get_active_sprint_id() -> int | None:
         return None
 
 
+def _generate_ticket_analysis(vuln: dict) -> dict | None:
+    """Use AI to generate detailed analysis for a Jira ticket."""
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return None
+
+    llm = ChatAnthropic(model="claude-haiku-4-5-20251001", temperature=0, max_tokens=4096)
+
+    prompt = f"""You are a senior application security engineer writing a detailed Jira ticket for a development team.
+Analyze this vulnerability and provide comprehensive, actionable instructions.
+
+Vulnerability:
+- Title: {vuln.get('title', 'Unknown')}
+- Severity: {vuln.get('severity', 'MEDIUM')}
+- File: {vuln.get('file', 'unknown')}
+- Line: {vuln.get('line', 0)}
+- Source Scanner: {vuln.get('source', 'unknown')}
+- Description: {vuln.get('description', '')}
+
+Respond with a JSON object:
+{{
+  "explanation": "2-3 sentences explaining what this vulnerability is and why it exists in the code",
+  "impact": "2-3 sentences on what an attacker could achieve if they exploit this. Be specific about the attack scenario.",
+  "fix_steps": ["Step 1: ...", "Step 2: ...", "Step 3: ..."],
+  "code_before": "example of the vulnerable code pattern",
+  "code_after": "example of the fixed code pattern",
+  "prevention": "How to prevent this class of vulnerability going forward (e.g., linting rules, code review checklist items, libraries to use)",
+  "references": "Relevant OWASP links, CWE IDs, or security best practice references"
+}}
+
+Respond ONLY with the JSON object."""
+
+    try:
+        resp = llm.invoke([HumanMessage(content=prompt)])
+        text = resp.content.strip()
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+    except Exception:
+        pass
+    return None
+
+
 def create_jira_ticket(vuln: dict, project_key: str | None = None, inspect_data: dict | None = None) -> dict:
     """Create a Jira ticket for a vulnerability.
 
@@ -526,30 +569,67 @@ def create_jira_ticket(vuln: dict, project_key: str | None = None, inspect_data:
     severity = vuln.get("severity", "MEDIUM")
     title = f"[{severity}] {vuln.get('title', 'Security Issue')}"
 
+    # Generate AI-powered detailed analysis for the ticket
+    ai_analysis = _generate_ticket_analysis(vuln)
+
     # Build description
     desc_parts = [
-        f"*Security vulnerability detected by SecScan Agent*\n",
+        f"h2. Security Vulnerability Detected by SecScan Agent\n",
         f"||Field||Value||",
-        f"|Severity|{severity}|",
+        f"|Severity|*{severity}*|",
         f"|File|{{monospace}}{vuln.get('file', 'unknown')}:{vuln.get('line', '?')}{{monospace}}|",
-        f"|Source|{vuln.get('source', 'unknown')}|",
+        f"|Scanner Source|{vuln.get('source', 'unknown')}|",
         f"|Confidence|{vuln.get('confidence', 'N/A')}|",
         f"|Scan ID|{vuln.get('id', 'N/A')}|",
-        f"\n*Description:*\n{vuln.get('description', 'No description available.')}",
+        f"\nh3. What Was Found",
+        f"{vuln.get('description', 'No description available.')}",
     ]
 
-    if inspect_data:
+    # Add AI-generated analysis
+    if ai_analysis:
+        desc_parts.append(f"\nh3. Why This Is Dangerous")
+        desc_parts.append(ai_analysis.get("explanation", ""))
+        desc_parts.append(f"\nh3. Potential Impact")
+        desc_parts.append(ai_analysis.get("impact", ""))
+        if ai_analysis.get("fix_steps"):
+            desc_parts.append(f"\nh3. Step-by-Step Fix Instructions")
+            for i, step in enumerate(ai_analysis["fix_steps"], 1):
+                desc_parts.append(f"# {step}")
+        if ai_analysis.get("code_before"):
+            desc_parts.append(f"\nh3. Vulnerable Code (Before)")
+            desc_parts.append(f"{{code}}\n{ai_analysis['code_before']}\n{{code}}")
+        if ai_analysis.get("code_after"):
+            desc_parts.append(f"\nh3. Fixed Code (After)")
+            desc_parts.append(f"{{code}}\n{ai_analysis['code_after']}\n{{code}}")
+        if ai_analysis.get("prevention"):
+            desc_parts.append(f"\nh3. How to Prevent This in Future")
+            desc_parts.append(ai_analysis["prevention"])
+        if ai_analysis.get("references"):
+            desc_parts.append(f"\nh3. References")
+            desc_parts.append(ai_analysis["references"])
+    elif inspect_data:
         if inspect_data.get("explanation"):
-            desc_parts.append(f"\n*Explanation:*\n{inspect_data['explanation']}")
+            desc_parts.append(f"\nh3. Why This Is Dangerous")
+            desc_parts.append(inspect_data['explanation'])
         if inspect_data.get("impact"):
-            desc_parts.append(f"\n*Impact:*\n{inspect_data['impact']}")
+            desc_parts.append(f"\nh3. Potential Impact")
+            desc_parts.append(inspect_data['impact'])
         if inspect_data.get("fix_steps"):
-            steps = "\n".join(f"# {s}" for s in inspect_data["fix_steps"])
-            desc_parts.append(f"\n*Steps to Fix:*\n{steps}")
+            desc_parts.append(f"\nh3. Step-by-Step Fix Instructions")
+            for i, step in enumerate(inspect_data["fix_steps"], 1):
+                desc_parts.append(f"# {step}")
+        if inspect_data.get("code_before"):
+            desc_parts.append(f"\nh3. Vulnerable Code (Before)")
+            desc_parts.append(f"{{code}}\n{inspect_data['code_before']}\n{{code}}")
         if inspect_data.get("code_after"):
-            desc_parts.append(f"\n*Suggested Fix:*\n{{code}}\n{inspect_data['code_after']}\n{{code}}")
+            desc_parts.append(f"\nh3. Fixed Code (After)")
+            desc_parts.append(f"{{code}}\n{inspect_data['code_after']}\n{{code}}")
         if inspect_data.get("prevention"):
-            desc_parts.append(f"\n*Prevention:*\n{inspect_data['prevention']}")
+            desc_parts.append(f"\nh3. How to Prevent This in Future")
+            desc_parts.append(inspect_data['prevention'])
+
+    desc_parts.append(f"\n----")
+    desc_parts.append(f"_Auto-generated by SecScan Agent_")
 
     fields = {
         "project": {"key": project},
@@ -733,104 +813,300 @@ def autofix_from_scan(repo_url: str, vulnerabilities: list[dict]) -> dict:
     except subprocess.CalledProcessError:
         pass
 
+    fixes = _apply_fixes_to_repo(tmp, fixable)
+
+    return _commit_push_and_pr(tmp, fixes, branch_name, repo_url)
+
+
+def autofix_from_jira(repo_url: str) -> dict:
+    """Fetch all open security tickets from Jira, clone repo, fix all issues, and raise a PR.
+
+    This is the Jira-driven auto-fix agent:
+    1. Fetches all open security tickets from the configured Jira project
+    2. Parses vulnerability details (file, line, title, description) from each ticket
+    3. Clones the target repository
+    4. Creates a new branch 'security-fixes'
+    5. Uses AI to generate and apply fixes for each vulnerability
+    6. Commits all changes, pushes the branch, and opens a PR
+    7. Transitions fixed Jira tickets to 'Done'
+    """
+    if not repo_url:
+        return {"error": "repo_url is required.", "fixes": []}
+
+    # Step 1: Fetch open security tickets from Jira
+    tickets = fetch_jira_security_tickets()
+    if not tickets:
+        return {"error": "No open security tickets found in Jira.", "fixes": [], "tickets_found": 0}
+
+    # Step 2: Parse vulnerability info from ticket summaries/descriptions
+    vulns_from_jira = _parse_jira_tickets_to_vulns(tickets)
+    if not vulns_from_jira:
+        return {"error": "Could not parse vulnerability details from Jira tickets.", "fixes": [], "tickets_found": len(tickets)}
+
+    # Step 3: Clone repo
+    tmp = tempfile.mkdtemp(prefix="jirafix_")
+    try:
+        subprocess.run(
+            ["git", "clone", repo_url, tmp],
+            check=True, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Clone failed: {e.stderr}", "fixes": []}
+
+    # Step 4: Create branch
+    branch_name = "security-fixes"
+    try:
+        subprocess.run(["git", "checkout", "-b", branch_name], cwd=tmp, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError:
+        # Branch might exist, try switching
+        try:
+            subprocess.run(["git", "checkout", branch_name], cwd=tmp, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError:
+            pass
+
+    # Step 5: Apply AI fixes
+    fixes = _apply_fixes_to_repo(tmp, vulns_from_jira)
+
+    # Step 6: Commit, push, and create PR
+    result = _commit_push_and_pr(tmp, fixes, branch_name, repo_url)
+
+    # Step 7: Transition fixed tickets to Done in Jira
+    applied = [f for f in fixes if f["status"] == "fixed"]
+    transitioned = []
+    for fix in applied:
+        jira_key = fix.get("jira_key", "")
+        if jira_key:
+            success = _transition_jira_ticket_done(jira_key)
+            transitioned.append({"key": jira_key, "transitioned": success})
+
+    result["tickets_found"] = len(tickets)
+    result["tickets_parsed"] = len(vulns_from_jira)
+    result["tickets_transitioned"] = transitioned
+    return result
+
+
+def _parse_jira_tickets_to_vulns(tickets: list[dict]) -> list[dict]:
+    """Parse Jira ticket summaries and descriptions to extract vulnerability details."""
+    vulns = []
+    for ticket in tickets:
+        summary = ticket.get("summary", "")
+        description = ticket.get("description", "")
+        jira_key = ticket.get("key", "")
+
+        # If description is ADF (dict), extract text
+        if isinstance(description, dict):
+            description = _extract_text_from_adf(description)
+
+        # Extract severity from summary like "[CRITICAL] Title"
+        severity = "HIGH"
+        sev_match = re.search(r'\[(CRITICAL|HIGH|MEDIUM|LOW)\]', summary)
+        if sev_match:
+            severity = sev_match.group(1)
+
+        # Extract file path and line from description
+        file_path = ""
+        line_num = 0
+        file_match = re.search(r'(?:File|file)[:\s|]*[{]?(?:monospace)?[}]?\s*([^\s|{}\n]+\.\w+):?(\d+)?', description)
+        if file_match:
+            file_path = file_match.group(1)
+            if file_match.group(2):
+                line_num = int(file_match.group(2))
+
+        # Clean title from summary
+        title = re.sub(r'\[(CRITICAL|HIGH|MEDIUM|LOW)\]\s*', '', summary).strip()
+
+        vulns.append({
+            "id": jira_key,
+            "jira_key": jira_key,
+            "file": file_path,
+            "line": line_num,
+            "severity": severity,
+            "title": title,
+            "description": description[:2000],
+            "source": "jira",
+        })
+
+    return vulns
+
+
+def _extract_text_from_adf(adf: dict) -> str:
+    """Recursively extract plain text from Atlassian Document Format."""
+    if isinstance(adf, str):
+        return adf
+    text_parts = []
+    if isinstance(adf, dict):
+        if adf.get("type") == "text":
+            text_parts.append(adf.get("text", ""))
+        for child in adf.get("content", []):
+            text_parts.append(_extract_text_from_adf(child))
+    elif isinstance(adf, list):
+        for item in adf:
+            text_parts.append(_extract_text_from_adf(item))
+    return " ".join(text_parts)
+
+
+def _apply_fixes_to_repo(repo_path: str, vulns: list[dict]) -> list[dict]:
+    """Apply AI-generated fixes for each vulnerability in the cloned repo."""
     fixes = []
-    for vuln in fixable:
+    for vuln in vulns:
         file_rel = vuln.get("file", "")
         if not file_rel:
+            fixes.append({
+                "vuln_id": vuln.get("id", "?"), "jira_key": vuln.get("jira_key", ""),
+                "title": vuln.get("title", ""), "status": "skipped", "reason": "no file path found",
+            })
             continue
-        file_abs = os.path.join(tmp, file_rel)
+        file_abs = os.path.join(repo_path, file_rel)
         if not os.path.isfile(file_abs):
-            fixes.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", ""), "status": "skipped", "reason": "file not found"})
+            fixes.append({
+                "vuln_id": vuln.get("id", "?"), "jira_key": vuln.get("jira_key", ""),
+                "title": vuln.get("title", ""), "status": "skipped", "reason": "file not found",
+            })
             continue
 
         try:
             with open(file_abs, "r", errors="ignore") as f:
                 original = f.read()
         except Exception:
-            fixes.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", ""), "status": "skipped", "reason": "could not read file"})
+            fixes.append({
+                "vuln_id": vuln.get("id", "?"), "jira_key": vuln.get("jira_key", ""),
+                "title": vuln.get("title", ""), "status": "skipped", "reason": "could not read file",
+            })
             continue
 
         fix_result = _generate_fix_for_vuln(
             vuln.get("title", ""), vuln.get("description", ""), file_rel, original
         )
         if not fix_result or not fix_result.get("fixed_content"):
-            fixes.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", ""), "status": "failed", "reason": "AI could not generate fix"})
+            fixes.append({
+                "vuln_id": vuln.get("id", "?"), "jira_key": vuln.get("jira_key", ""),
+                "title": vuln.get("title", ""), "status": "failed", "reason": "AI could not generate fix",
+            })
             continue
 
         fixed_content = fix_result["fixed_content"]
         if fixed_content.strip() == original.strip():
-            fixes.append({"vuln_id": vuln.get("id", "?"), "title": vuln.get("title", ""), "status": "skipped", "reason": "no changes needed"})
+            fixes.append({
+                "vuln_id": vuln.get("id", "?"), "jira_key": vuln.get("jira_key", ""),
+                "title": vuln.get("title", ""), "status": "skipped", "reason": "no changes needed",
+            })
             continue
 
-        # Write fix
         with open(file_abs, "w") as f:
             f.write(fixed_content)
 
         fixes.append({
             "vuln_id": vuln.get("id", "?"),
+            "jira_key": vuln.get("jira_key", ""),
             "title": vuln.get("title", ""),
             "file": file_rel,
             "status": "fixed",
             "summary": fix_result.get("changes_summary", ""),
         })
 
-    # Check if any fixes were applied
+    return fixes
+
+
+def _commit_push_and_pr(repo_path: str, fixes: list[dict], branch_name: str, repo_url: str) -> dict:
+    """Commit fixes, push branch, and create PR. Returns result dict."""
     applied = [f for f in fixes if f["status"] == "fixed"]
     if not applied:
-        shutil.rmtree(tmp, ignore_errors=True)
-        return {"fixes": fixes, "pr_url": None, "message": "No fixes could be applied."}
+        shutil.rmtree(repo_path, ignore_errors=True)
+        return {"fixes": fixes, "pr_url": None, "fixed_count": 0, "message": "No fixes could be applied."}
 
-    # Commit and push
     try:
-        subprocess.run(["git", "add", "-A"], cwd=tmp, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo_path, check=True, capture_output=True, text=True)
 
-        commit_msg = f"fix: auto-fix {len(applied)} security vulnerabilities\n\n"
+        commit_msg = f"fix: resolve {len(applied)} security vulnerabilities\n\n"
         for f in applied:
-            commit_msg += f"- [{f['vuln_id']}] {f['title']} in {f.get('file', '?')}\n"
+            jira_ref = f" ({f['jira_key']})" if f.get("jira_key") else ""
+            commit_msg += f"- [{f['vuln_id']}] {f['title']} in {f.get('file', '?')}{jira_ref}\n"
         commit_msg += "\nGenerated by SecScan Agent"
 
         subprocess.run(
             ["git", "commit", "-m", commit_msg],
-            cwd=tmp, check=True, capture_output=True, text=True,
+            cwd=repo_path, check=True, capture_output=True, text=True,
             env={**os.environ, "GIT_AUTHOR_NAME": "SecScan Agent", "GIT_AUTHOR_EMAIL": "secscan@agent.local",
                  "GIT_COMMITTER_NAME": "SecScan Agent", "GIT_COMMITTER_EMAIL": "secscan@agent.local"},
         )
 
         subprocess.run(
             ["git", "push", "-u", "origin", branch_name],
-            cwd=tmp, check=True, capture_output=True, text=True, timeout=60,
+            cwd=repo_path, check=True, capture_output=True, text=True, timeout=60,
         )
     except subprocess.CalledProcessError as e:
-        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(repo_path, ignore_errors=True)
         return {"fixes": fixes, "pr_url": None, "error": f"Git push failed: {e.stderr[:300]}"}
 
-    # Create PR via gh CLI
+    # Create PR
     pr_url = None
     pr_body = "## Security Fixes\n\n"
-    pr_body += f"Auto-fixed **{len(applied)}** security vulnerabilities found by SecScan Agent.\n\n"
+    pr_body += f"Resolved **{len(applied)}** security vulnerabilities found by SecScan Agent.\n\n"
+    pr_body += "### Changes\n\n"
     for f in applied:
-        pr_body += f"- **[{f['vuln_id']}]** {f['title']} in `{f.get('file', '?')}`\n"
+        jira_ref = f" ({f['jira_key']})" if f.get("jira_key") else ""
+        pr_body += f"- **[{f['vuln_id']}]** {f['title']} in `{f.get('file', '?')}`{jira_ref}\n"
         if f.get("summary"):
             pr_body += f"  - {f['summary']}\n"
     pr_body += "\n---\n*Generated by SecScan Agent*"
 
     try:
         result = subprocess.run(
-            ["gh", "pr", "create", "--title", f"fix: auto-fix {len(applied)} security vulnerabilities",
+            ["gh", "pr", "create", "--title", f"fix: resolve {len(applied)} security vulnerabilities",
              "--body", pr_body, "--head", branch_name],
-            cwd=tmp, capture_output=True, text=True, timeout=30,
+            cwd=repo_path, capture_output=True, text=True, timeout=30,
         )
         if result.returncode == 0:
             pr_url = result.stdout.strip()
     except Exception:
         pass
 
-    shutil.rmtree(tmp, ignore_errors=True)
+    shutil.rmtree(repo_path, ignore_errors=True)
 
     return {
         "fixes": fixes,
         "pr_url": pr_url,
         "fixed_count": len(applied),
-        "total_attempted": len(fixable),
-        "message": f"Fixed {len(applied)}/{len(fixable)} vulnerabilities." + (f" PR: {pr_url}" if pr_url else " Push succeeded but PR creation failed (gh CLI may not be configured)."),
+        "total_attempted": len([f for f in fixes]),
+        "message": f"Fixed {len(applied)}/{len(fixes)} vulnerabilities." + (f" PR: {pr_url}" if pr_url else " Push succeeded but PR creation failed (gh CLI may not be configured)."),
     }
+
+
+def _transition_jira_ticket_done(issue_key: str) -> bool:
+    """Transition a Jira ticket to 'Done' status."""
+    base_url, email, token, _ = _get_jira_auth()
+    if not all([base_url, email, token]):
+        return False
+
+    try:
+        # Get available transitions
+        resp = http_requests.get(
+            f"{base_url}/rest/api/2/issue/{issue_key}/transitions",
+            auth=(email, token),
+            headers={"Accept": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return False
+
+        transitions = resp.json().get("transitions", [])
+        done_id = None
+        for t in transitions:
+            if t["name"].lower() in ("done", "resolved", "closed", "complete"):
+                done_id = t["id"]
+                break
+
+        if not done_id:
+            return False
+
+        # Execute transition
+        resp2 = http_requests.post(
+            f"{base_url}/rest/api/2/issue/{issue_key}/transitions",
+            json={"transition": {"id": done_id}},
+            auth=(email, token),
+            headers={"Content-Type": "application/json"},
+            timeout=10,
+        )
+        return resp2.status_code == 204
+    except Exception:
+        return False
