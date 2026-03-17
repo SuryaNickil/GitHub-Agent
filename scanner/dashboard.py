@@ -413,11 +413,11 @@ body { font-family: 'Inter', -apple-system, sans-serif; background: var(--bg); c
 <div class="chat-popup" id="chatPopup">
   <div class="chat-header">
     <h3>Security Agent</h3>
-    <span class="chat-badge">Haiku</span>
+    <span class="chat-badge">AI</span>
     <button class="chat-close-btn" onclick="toggleChat()">&times;</button>
   </div>
   <div class="chat-messages" id="chatMessages">
-    <div class="chat-msg agent">Hi! I'm your security assistant powered by Claude Haiku. Scan a repo and ask me anything about the findings.</div>
+    <div class="chat-msg agent">Hi! I'm your security assistant. Scan a repo and ask me anything about the findings.</div>
   </div>
   <div class="chat-input-area">
     <input class="chat-input" id="chatInput" placeholder="Ask about vulnerabilities..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}" />
@@ -582,7 +582,7 @@ async function inspectIssue(vuln) {
       <span>Source: ${vuln.source}</span>
       <span>Confidence: ${vuln.confidence || 'N/A'}</span>
     </div>
-    <div class="inspect-loading"><div class="spinner"></div><br>Analyzing with Haiku...</div>`;
+    <div class="inspect-loading"><div class="spinner"></div><br>Analyzing vulnerability...</div>`;
   // Store vuln on overlay for Jira
   document.getElementById('inspectOverlay')._vuln = vuln;
   document.getElementById('inspectOverlay')._inspectData = null;
